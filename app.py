@@ -605,6 +605,58 @@ def build_excel(res) -> bytes:
 
 
 # ----------------------------------------------------------------------------
+# STEP 1: mapping file (CGC ke bina)
+# ----------------------------------------------------------------------------
+ISSUE_COLS = ["Issue", "Severity", "Details", "Parent group", "Child group", "Labeler", "Date", "Sheet row", "Suggestion"]
+
+
+def build_mapping_only(pairs, pre_issues):
+    """Label -> Group se mapping. Class abhi group ke naam jaisi rakhi jaati hai (Step 2 me CGC se verify)."""
+    issues = list(pre_issues)
+    rows, seen = [], set()
+    child_parents = defaultdict(set)
+    for p in pairs:
+        child_parents[strict(p["child"])].add(OTHERS if is_others(p["parent"]) else strict(p["parent"]))
+    for p in pairs:
+        other = is_others(p["parent"])
+        key = (OTHERS if other else strict(p["parent"]), strict(p["child"]))
+        base = {"Parent group": p["parent"], "Child group": p["child"], "Labeler": p["labeler"],
+                "Date": p["date"], "Sheet row": p["sheet_row"], "Suggestion": ""}
+        if key in seen:
+            issues.append({"Issue": "Duplicate row", "Severity": "Warning",
+                           "Details": "Same parent + child dobara aaya, sirf pehla liya", **base})
+            continue
+        seen.add(key)
+        if len(child_parents[key[1]]) > 1:
+            issues.append({"Issue": "Child multiple parents me", "Severity": "Warning",
+                           "Details": "Ye child group 1 se zyada parent ke neeche likha hai", **base})
+        pg = "others" if other else p["parent"].strip()
+        rows.append({"Parent group": pg, "Parent Class": pg, "Child Group": p["child"].strip(),
+                     "Child Class": p["child"].strip()})
+    m = pd.DataFrame(rows, columns=["Parent group", "Parent Class", "Child Group", "Child Class"])
+    iss = pd.DataFrame(issues, columns=ISSUE_COLS)
+    if not iss.empty:
+        iss["_o"] = iss["Severity"].map({"Error": 0, "Warning": 1})
+        iss = iss.sort_values(["_o", "Issue"]).drop(columns="_o").reset_index(drop=True)
+    return m, iss
+
+
+def simple_excel(sheets) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
+        head = xw.book.add_format({"bold": True, "bg_color": "#D9EAD3", "border": 1})
+        for name, df in sheets:
+            df.to_excel(xw, sheet_name=name, index=False)
+            ws = xw.sheets[name]
+            for j, col in enumerate(df.columns):
+                ws.write(0, j, col, head)
+                w = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).head(500)])
+                ws.set_column(j, j, min(max(12, w + 2), 60))
+            ws.freeze_panes(1, 0)
+    return out.getvalue()
+
+
+# ----------------------------------------------------------------------------
 # Streamlit UI
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
@@ -612,130 +664,114 @@ def _read(name, data):
     return read_raw(name, data)
 
 
-def main():
-    st.set_page_config(page_title="Mapping Sheet Builder", page_icon="🗂️", layout="wide")
-    st.title("🗂️ Mapping Sheet Builder")
-    st.caption("Label → Group sheet + CGC (class image ke saath) se Mapping sheet banao aur errors check karo.")
-
-    with st.sidebar:
-        st.header("Settings")
-        mode = st.radio(
-            "Kya karna hai?",
-            ["Mapping sheet banao (label → group file se)", "Existing mapping sheet validate karo"],
-        )
-        split_pending = st.checkbox("CGC ke multi-image groups (jinka split baaki hai) bhi list karo", value=True)
-        st.markdown(
-            "**Rules**\n"
-            "- Parent = group jisse naya group bana\n"
-            "- Parent/Child Class = CGC ke class_name se match\n"
-            "- Parent `other/others` → class bhi `others`\n"
-            "- Error wali rows Mapping me nahi jaati, **Errors** sheet me aati hain"
-        )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("1) " + ("Label → Group file" if mode.startswith("Mapping") else "Mapping file"))
-        f_main = st.file_uploader("csv / xlsx", type=["csv", "xlsx", "xls"], key="main")
-    with col2:
-        st.subheader("2) CGC file (class + group + image)")
-        f_cgc = st.file_uploader("xlsx / csv", type=["csv", "xlsx", "xls"], key="cgc")
-
-    if not f_main or not f_cgc:
-        st.info("Dono files upload karo.")
+def step1():
+    st.subheader("Step 1 — Label → Group file se Mapping sheet banao")
+    st.caption("Yahan CGC ki zaroorat nahi. Class abhi group ke naam jaisi rakhi jaati hai; Step 2 me CGC se verify hogi.")
+    f = st.file_uploader("Label → Group file (csv / xlsx)", type=["csv", "xlsx", "xls"], key="s1f")
+    if not f:
         return
+    sheets = _read(f.name, f.getvalue())
+    sh = st.selectbox("Sheet", list(sheets), key="s1s")
+    recs = parse_label_sheet(sheets[sh])
+    pairs, pre = labels_to_pairs(recs)
+    mapping, iss = build_mapping_only(pairs, pre)
+    errs = int((iss["Severity"] == "Error").sum()) if not iss.empty else 0
+    warns = int((iss["Severity"] == "Warning").sum()) if not iss.empty else 0
+    m = st.columns(4)
+    m[0].metric("Parent rows", len(recs))
+    m[1].metric("Mapping rows", len(mapping))
+    m[2].metric("Errors", errs)
+    m[3].metric("Warnings", warns)
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇ Mapping + Errors (Excel)", simple_excel([("Mapping", mapping), ("Errors", iss)]),
+                       file_name="mapping_sheet.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    d2.download_button("⬇ Sirf Mapping (CSV)", mapping.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="mapping.csv", mime="text/csv")
+    t1, t2 = st.tabs(["Mapping", "Errors (label file ki galtiyan)"])
+    t1.dataframe(mapping, width="stretch", hide_index=True)
+    if iss.empty:
+        t2.success("Koi error nahi")
+    else:
+        t2.dataframe(iss, width="stretch", hide_index=True)
 
-    main_sheets = _read(f_main.name, f_main.getvalue())
-    cgc_sheets = _read(f_cgc.name, f_cgc.getvalue())
 
+def step2():
+    st.subheader("Step 2 — Mapping file ko CGC se match karo")
+    st.caption("Group CGC me add hue ya nahi, class sahi hai ya nahi, image hai ya nahi — sab check hoga.")
     c1, c2 = st.columns(2)
-    main_sheet = c1.selectbox("File 1 ki sheet", list(main_sheets), key="ms")
-    cgc_sheet = c2.selectbox("CGC ki sheet", list(cgc_sheets), key="cs")
-    cgc_rows = cgc_sheets[cgc_sheet]
-
+    f_map = c1.file_uploader("Mapping file (Step 1 ka output ya tumhari banai hui)", type=["csv", "xlsx", "xls"], key="s2m")
+    f_cgc = c2.file_uploader("CGC file (class + group + image)", type=["csv", "xlsx", "xls"], key="s2c")
+    if not f_map or not f_cgc:
+        return
+    ms = _read(f_map.name, f_map.getvalue())
+    cs = _read(f_cgc.name, f_cgc.getvalue())
+    a, b = st.columns(2)
+    msh = a.selectbox("Mapping sheet", list(ms), key="s2ms")
+    csh = b.selectbox("CGC sheet", list(cs), key="s2cs")
+    cgc_rows = cs[csh]
     hdr_i, header, class_j, group_j, img_js = guess_cgc_columns(cgc_rows)
-    with st.expander("CGC columns (auto-detect hue hain, galat ho to badlo)", expanded=class_j is None or not img_js):
-        opts = [f"{j}: {h or '(blank)'}" for j, h in enumerate(header)]
-        none = "— none —"
-        sel_class = st.selectbox("class_name column", [none] + opts, index=(class_j + 1) if class_j is not None else 0)
-        sel_group = st.selectbox("group_name column", [none] + opts, index=(group_j + 1) if group_j is not None else 0)
-        sel_imgs = st.multiselect("image link column(s)", opts, default=[opts[j] for j in img_js])
-
-    def idx(s):
-        return None if s == none else int(s.split(":")[0])
-
-    class_j, group_j = idx(sel_class), idx(sel_group)
-    img_js = [int(s.split(":")[0]) for s in sel_imgs]
+    none = "— none —"
+    opts = [f"{j}: {h or '(blank)'}" for j, h in enumerate(header)]
+    with st.expander("CGC columns (auto-detect, galat ho to badlo)", expanded=class_j is None or not img_js):
+        sc = st.selectbox("class_name column", [none] + opts, index=(class_j + 1) if class_j is not None else 0)
+        sg = st.selectbox("group_name column", [none] + opts, index=(group_j + 1) if group_j is not None else 0)
+        si = st.multiselect("image link column(s)", opts, default=[opts[j] for j in img_js])
+    idx = lambda s: None if s == none else int(s.split(":")[0])
+    class_j, group_j, img_js = idx(sc), idx(sg), [int(x.split(":")[0]) for x in si]
     if class_j is None and group_j is None:
-        st.error("CGC me class_name ya group_name column chuno.")
+        st.error("class_name ya group_name column chuno.")
         return
     if not img_js:
         st.warning("Image column nahi chuna — image checks skip honge.")
+    split_pending = st.checkbox("CGC ke multi-image groups (split baaki) bhi list karo", value=True)
 
-    if st.button("▶ Generate", type="primary"):
+    if st.button("▶ CGC se match karo", type="primary"):
         with st.spinner("Matching chal raha hai…"):
             cgc = build_cgc(cgc_rows, hdr_i, class_j, group_j, img_js)
-            if mode.startswith("Mapping"):
-                recs = parse_label_sheet(main_sheets[main_sheet])
-                pairs, pre = labels_to_pairs(recs)
-                res = analyze(pairs, cgc, pre, False, split_pending)
-                res["n_parents"] = len(recs)
-            else:
-                pairs = parse_mapping_sheet(main_sheets[main_sheet])
-                res = analyze(pairs, cgc, [], True, split_pending)
-                res["n_parents"] = len({strict(p["parent"]) for p in pairs})
-            res["cgc_rows"] = cgc.n_rows
-            res["cgc_groups"] = len(cgc.group)
+            pairs = parse_mapping_sheet(ms[msh])
+            res = analyze(pairs, cgc, [], True, split_pending)
+            res["cgc_rows"], res["cgc_groups"] = cgc.n_rows, len(cgc.group)
             res["excel"] = build_excel(res)
         st.session_state["res"] = res
 
     res = st.session_state.get("res")
     if not res:
         return
-
-    errs = int((res["issues"]["Severity"] == "Error").sum()) if not res["issues"].empty else 0
-    warns = int((res["issues"]["Severity"] == "Warning").sum()) if not res["issues"].empty else 0
+    iss = res["issues"]
+    errs = int((iss["Severity"] == "Error").sum()) if not iss.empty else 0
+    warns = int((iss["Severity"] == "Warning").sum()) if not iss.empty else 0
     m = st.columns(5)
-    m[0].metric("Mapping rows (clean)", len(res["mapping"]))
+    m[0].metric("Clean rows", len(res["mapping"]))
     m[1].metric("Errors", errs)
     m[2].metric("Warnings", warns)
     m[3].metric("CGC me nahi mile", len(res["notin"]))
-    m[4].metric("Split pending (multi-image)", len(res["pending"]))
+    m[4].metric("Split pending", len(res["pending"]))
     st.caption(f"CGC: {res['cgc_rows']} rows, {res['cgc_groups']} unique groups.")
-
     d1, d2 = st.columns(2)
-    d1.download_button(
-        "⬇ Full Excel (Mapping + Errors + extra sheets)",
-        res["excel"],
-        file_name="mapping_sheet_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-    d2.download_button(
-        "⬇ Sirf Mapping (CSV)",
-        res["mapping"].to_csv(index=False).encode("utf-8-sig"),
-        file_name="mapping.csv",
-        mime="text/csv",
-    )
-
-    tabs = st.tabs(["Mapping", "Errors", "Not in CGC", "Multi-image", "Split pending", "Image review"])
+    d1.download_button("⬇ Full Excel (Errors + Not in CGC + extra)", res["excel"], file_name="cgc_match_report.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    d2.download_button("⬇ Corrected Mapping (CSV, CGC ke exact class ke saath)",
+                       res["mapping"].to_csv(index=False).encode("utf-8-sig"),
+                       file_name="mapping_corrected.csv", mime="text/csv")
+    tabs = st.tabs(["Errors", "Not in CGC", "Multi-image", "Split pending", "Corrected mapping", "Image review"])
     with tabs[0]:
-        st.dataframe(res["mapping"], width="stretch", hide_index=True)
-    with tabs[1]:
-        if res["issues"].empty:
+        if iss.empty:
             st.success("Koi error/warning nahi 🎉")
         else:
-            kind = st.multiselect("Filter", sorted(res["issues"]["Issue"].unique()))
-            df = res["issues"] if not kind else res["issues"][res["issues"]["Issue"].isin(kind)]
-            st.dataframe(df, width="stretch", hide_index=True)
-    with tabs[2]:
-        st.caption("Ye groups label sheet / mapping me hain lekin CGC me add nahi hue.")
+            kind = st.multiselect("Filter", sorted(iss["Issue"].unique()))
+            st.dataframe(iss if not kind else iss[iss["Issue"].isin(kind)], width="stretch", hide_index=True)
+    with tabs[1]:
+        st.caption("Ye groups mapping me hain lekin CGC me add nahi hue.")
         st.dataframe(res["notin"], width="stretch", hide_index=True)
-    with tabs[3]:
+    with tabs[2]:
         st.caption("Mapping me use hue groups jinme 1 se zyada image hai.")
         st.dataframe(res["multi"], width="stretch", hide_index=True)
-    with tabs[4]:
-        st.caption("CGC ke multi-image groups jo label sheet me parent ke roop me aaye hi nahi (alag group banana baaki).")
+    with tabs[3]:
+        st.caption("CGC ke multi-image groups jo mapping me parent ke roop me aaye hi nahi.")
         st.dataframe(res["pending"], width="stretch", hide_index=True)
+    with tabs[4]:
+        st.dataframe(res["mapping"], width="stretch", hide_index=True)
     with tabs[5]:
         rv = res["review"]
         if rv.empty:
@@ -744,14 +780,24 @@ def main():
             labels = [f"{i}: {r['Parent group']} → {r['Child Group']} [{r['Status']}]" for i, r in rv.iterrows()]
             pick = st.selectbox("Row chuno", range(len(rv)), format_func=lambda i: labels[i])
             r = rv.iloc[pick]
-            a, b = st.columns(2)
-            for col, title, key in ((a, "Parent images", "Parent images"), (b, "Child images", "Child images")):
-                col.markdown(f"**{title}**")
+            x, y = st.columns(2)
+            for col, key in ((x, "Parent images"), (y, "Child images")):
+                col.markdown(f"**{key}**")
                 urls = [u for u in str(r[key]).split("\n") if u.startswith("http")]
                 if not urls:
                     col.caption("— image nahi —")
                 for u in urls[:6]:
                     col.image(u, width=180)
+
+
+def main():
+    st.set_page_config(page_title="Mapping Sheet Builder", page_icon="🗂️", layout="wide")
+    st.title("🗂️ Mapping Sheet Builder")
+    t1, t2 = st.tabs(["Step 1: Mapping banao", "Step 2: CGC match"])
+    with t1:
+        step1()
+    with t2:
+        step2()
 
 
 if __name__ == "__main__":
